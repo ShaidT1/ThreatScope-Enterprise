@@ -1,10 +1,13 @@
 # File: src/services/threat_detection_service.py
-
+from .automated_response_service import AutomateResponseServices
+from .notification_service import NotifactionService
 import ipaddress
 import re
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from ..config.response_playbooks import ResponsePlaybooks
+import asyncio
 import subprocess
 
 from .geo_intelligence_service import GeointelligenceServices
@@ -15,17 +18,28 @@ logger = logging.getLogger(__name__)
 seen_ip = set()
 
 
-def ban(ip: str):
+async def ban(ip: str):
+    """Asynchronously ban IP using iptables."""
     cmd = f"sudo iptables -A INPUT -s {ip} -j DROP"
     try:
-        subprocess.run(cmd, shell=True, check=True)
-        logger.info(f"Banned IP {ip}")
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info(f"Banned IP {ip}")
+        else:
+            logger.error(f"Failed to ban IP {ip}: {stderr.decode().strip()}")
     except Exception as e:
-        logger.error(f"Failed to ban IP {ip}: {e}")
+        logger.error(f"Error banning IP {ip}: {e}")
 
 
 class ThreatDetectionService:
     def __init__(self):
+        self.response_service = AutomateResponseServices()
+        self.notification_service = NotifactionService()  # fixed class name
         self.geo_service = GeointelligenceServices()
         self.mitre_service = MitreService()
         self.database_service = DatabaseService()
@@ -40,11 +54,11 @@ class ThreatDetectionService:
             r"python.*-c",
             r"powershell.*-enc",
         ]
-        self.bad_countries = {"russia", "ukrain", "china", "iran", "north korea"}
-        self.bad_isp = {"unkown", "anonymous", "vpn", "proxy"}
+        self.bad_countries = {"russia", "ukraine", "china", "iran", "north korea"}
+        self.bad_isp = {"unknown", "anonymous", "vpn", "proxy"}
 
     def extract_ip(self, content: str) -> Optional[str]:
-        """Extract the first IP address found in the content"""
+        """Extract the first IP address found in the content."""
         if isinstance(content, dict):
             for v in content.values():
                 if isinstance(v, str):
@@ -54,7 +68,7 @@ class ThreatDetectionService:
                         try:
                             ipaddress.ip_address(ip)
                             return ip
-                        except Exception:
+                        except ValueError:
                             continue
         elif isinstance(content, str):
             m = re.search(r"(?:\d{1,3}\.){3}\d{1,3}", content)
@@ -63,7 +77,7 @@ class ThreatDetectionService:
                 try:
                     ipaddress.ip_address(ip)
                     return ip
-                except Exception:
+                except ValueError:
                     pass
         return None
 
@@ -95,13 +109,13 @@ class ThreatDetectionService:
 
         return score, threats
 
-    def cal_severity(self, score: int) -> str:
+    def calc_severity(self, score: int) -> str:
         if score >= 15:
             return "critical"
         if score >= 10:
             return "high"
         if score >= 5:
-            return "mid"
+            return "medium"
         return "low"
 
     async def process_event(self, content: str, source_type: str = "manual") -> Dict:
@@ -118,7 +132,39 @@ class ThreatDetectionService:
                 score += 5
                 threat_types.append(mitre_data.get("name", "unknown"))
 
-            severity = self.cal_severity(score)
+            severity = self.calc_severity(score)
+
+            # Response actions
+            response_actions = self._determine_response_action(severity, ' , '.join(threat_types), score)
+            if response_actions:
+                await self.response_service.execute_response(
+                    {
+                        "ip_address": ip,
+                        "severity": severity,
+                        "score": score,
+                        "threat_type": ", ".join(threat_types),
+                        "raw_data": content,
+                    },
+                    response_actions,
+                )
+
+            # Notifications
+            if score >= 10:
+                notification_channels = self._get_notification_channel(severity, ', '.join(threat_types), score)
+                if notification_channels:
+                    await self.notification_service.send_threat_alert(
+                        {
+                            "ip_address": ip,
+                            "score": score,
+                            "threat_type": ", ".join(threat_types),
+                            "country": geo.get("country", ""),
+                            "city": geo.get("city", ""),
+                            "mitre_id": mitre_data["id"] if mitre_data else None,
+                            "raw_data": content,
+                        },
+                        notification_channels,
+                        severity_threshold="medium",
+                    )
 
             event_data = {
                 "ip_address": ip,
@@ -136,14 +182,14 @@ class ThreatDetectionService:
                 "raw_data": content[:1000],
                 "source_type": source_type,
                 "blocked": False,
-                "notified": False,
+                "notified": score >= 10,
             }
 
             threat_event_id = self.database_service.create_threat_event(event_data)
-			
+
             banned = False
             if score >= 5 and ip not in seen_ip:
-                ban(ip)
+                await ban(ip)
                 banned = True
                 seen_ip.add(ip)
                 self.database_service.update_event(threat_event_id, {"blocked": True})
@@ -157,5 +203,21 @@ class ThreatDetectionService:
             }
 
         except Exception as e:
-            logger.error(f"Error processing event: {e}")
+            logger.exception(f"Error processing event: {e}")
             return {"error": str(e)}
+
+    def _determine_response_action(self, severity: str,  threat_type: str, score: int) -> List[str]:
+        playbook = ResponsePlaybooks.get_playbook(severity, threat_type, score)
+        
+        if playbook['auto_escalte']:
+	        return playbook['actions']
+        else:
+            return playbook['collection_evidence']
+	
+        
+
+    def _get_notification_channel(self, severity: str, threat_type: str, score: int) -> List[str]:
+        playbook = ResponsePlaybooks.get_playbook(severity, threat_type, score)
+        return playbook['notification_channels']
+        
+		

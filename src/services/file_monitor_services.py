@@ -3,7 +3,7 @@ from watchdog.observers import Observer
 import asyncio
 import queue
 import threading
-from typing import Callable, List
+from typing import Callable
 import logging
 from scapy.utils import PcapReader
 from scapy.all import TCP, IP, Raw
@@ -24,9 +24,10 @@ class FileMonitoringService:
         self.running = True
         file_types_list = file_types.split(",")
 
-        # Start worker thread
-        self.work_thread = threading.Thread(target=self.worker_queue, daemon=True)
-        self.work_thread.start()
+        # Start worker thread if not already running
+        if not self.work_thread or not self.work_thread.is_alive():
+            self.work_thread = threading.Thread(target=self.worker_queue, daemon=True)
+            self.work_thread.start()
 
         # Schedule handlers
         if "json" in file_types_list:
@@ -42,22 +43,30 @@ class FileMonitoringService:
 
     def stop_monitoring(self):
         self.running = False
-        self.observer.stop()
-        self.observer.join()
 
-        if self.work_thread:
+        if hasattr(self, "observer") and self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join(timeout=5)
+
+        if self.work_thread and self.work_thread.is_alive():
             self.work_thread.join(timeout=5)
+
         logger.info("Stopped monitoring")
 
     def worker_queue(self):
         while self.running:
             try:
                 source_type, content = self.work_queue.get(timeout=1)
-                asyncio.create_task(self.event_processor(source_type, content))
+                # Safely schedule async task in the running loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self.event_processor(source_type, content), loop)
+                else:
+                    asyncio.run(self.event_processor(source_type, content))
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(e)
+                logger.error(f"Worker queue error: {e}")
 
 # Handlers
 class JsonHandler(FileSystemEventHandler):
